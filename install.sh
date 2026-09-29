@@ -1,9 +1,5 @@
 #!/bin/bash
 # Install hypr-gui into ~/.local. No root, no system files touched.
-#
-# NOTE: this script and the app it installs were written by an AI coding
-# assistant in a single session and never reviewed by a human. Read them
-# first. See README.md.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,9 +42,11 @@ fi
 
 # --- install -------------------------------------------------------------
 mkdir -p "$PREFIX/hypr-gui" "$BIN" "$APPS"
-install -m 644 "$SRC/hypr_gui.py"   "$PREFIX/hypr-gui/hypr_gui.py"
-install -m 644 "$SRC/test_hypr_gui.py" "$PREFIX/hypr-gui/test_hypr_gui.py"
-install -m 644 "$SRC/README.md"     "$PREFIX/hypr-gui/README.md"
+install -m 644 "$SRC/hypr_gui.py"        "$PREFIX/hypr-gui/hypr_gui.py"
+for t in test_hypr_gui.py test_dispatchers.py test_ui.py; do
+  [ -f "$SRC/$t" ] && install -m 644 "$SRC/$t" "$PREFIX/hypr-gui/$t"
+done
+install -m 644 "$SRC/README.md"          "$PREFIX/hypr-gui/README.md"
 if [ -f "$SRC/LICENSE" ]; then
   install -m 644 "$SRC/LICENSE" "$PREFIX/hypr-gui/LICENSE"
 fi

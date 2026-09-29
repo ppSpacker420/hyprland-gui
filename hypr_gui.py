@@ -1,20 +1,10 @@
 #!/usr/bin/python3
-"""hypr-gui - a graphical settings editor for Hyprland.
+"""hypr-gui — a graphical settings editor for this machine's Hyprland (Lua config).
 
-  ##########################################################################
-  # THIS FILE WAS WRITTEN BY AN AI CODING ASSISTANT (Claude, via Hermes    #
-  # Agent) IN A SINGLE SESSION. NO HUMAN WROTE OR REVIEWED IT.               #
-  #                                                                         #
-  # It edits your window manager's config. Read it before you run it.       #
-  # The .conf backend has never been parsed by a real Hyprland.             #
-  # See README.md for the full caveats.                                     #
-  ##########################################################################
-
-Read current values from the compositor, let you change them, and write your
-changes into ~/.config/hypr/hyprgui.lua (or hyprgui.conf on pre-0.56
-Hyprland), which is generated from ~/.config/hypr/.hypr-gui-state.json. Only
-settings you actually touch are written, so distro defaults and your
-hand-written files keep working.
+Reads live values from the compositor, lets you change them, and writes your
+changes into ~/.config/hypr/hyprgui.lua, which is generated from
+~/.config/hypr/.hypr-gui-state.json. Only settings you actually touch are
+written, so Omarchy defaults and your hand-written files keep working.
 """
 
 import json
@@ -72,6 +62,222 @@ def hypr_json(*args):
         return json.loads(hypr("-j", *args) or "null")
     except json.JSONDecodeError:
         return None
+
+
+# --------------------------------------------------------------------------
+# dispatchers and commands
+# --------------------------------------------------------------------------
+
+# Taken from https://wiki.hypr.land/configuring/core/dispatchers/ (Lua config,
+# Hyprland 0.56+). On the older .conf format the same actions are spelled
+# without hl.dsp, e.g. "killactive" rather than hl.dsp.close().
+# The Lua API (Hyprland 0.56+) namespaces most actions: hl.dsp.window.close(),
+# not hl.dsp.close(). The names and arg keys below were read out of the running
+# compositor's own hl.dsp tables, not from documentation, so they match reality
+# rather than a wiki page that may be ahead of or behind the installed version.
+#
+#   (display name, lua call path, arg key or None, description)
+# Each entry: (display name, lua call path, arg key, plain-string?, description)
+#
+# The names, arg keys and calling conventions below were read out of the running
+# compositor by probing hl.dsp directly, not copied from documentation: the
+# 0.56+ Lua API namespaces most actions (hl.dsp.window.close, not
+# hl.dsp.close), and six of them take a bare string rather than a table.
+# plain=True means call it as hl.dsp.foo("value") instead of foo({ key = "value" }).
+DISPATCHERS = [
+    # --- window
+    ("close", "window.close", None, False, "Close the focused window"),
+    ("kill", "window.kill", None, False, "Kill the window's process with SIGKILL"),
+    ("fullscreen", "window.fullscreen", "mode", False, "Fullscreen: maximized, fullscreen or none"),
+    ("float", "window.float", "action", False, "Float a window: toggle, enable or disable"),
+    ("move", "window.move", "direction", False, "Move the window: left, right, up or down"),
+    ("resize", "window.resize", "x", False, "Resize the window by a pixel amount"),
+    ("swap", "window.swap", "direction", False, "Swap the window with its neighbour"),
+    ("pin", "window.pin", "window", False, "Pin the window to every workspace"),
+    ("center", "window.center", None, False, "Center the window on screen"),
+    ("cycle next", "window.cycle_next", None, False, "Focus the next window"),
+    ("bring to top", "window.bring_to_top", None, False, "Raise the window above others"),
+    ("alter zorder", "window.alter_zorder", "mode", False, "Send the window to top or bottom"),
+    ("clear tags", "window.clear_tags", "window", False, "Clear the window's tags"),
+    ("drag", "window.drag", None, False, "Begin an interactive drag (mouse binds)"),
+    ("pseudo", "window.pseudo", "toggle", False, "Toggle pseudotiling for the window"),
+    ("show swallowed", "window.toggle_swallow", None, False, "Toggle swallowed windows visible"),
+    ("set prop", "window.set_prop", "prop", False, "Set a window property, e.g. alpha"),
+    ("signal", "window.signal", "signal", False, "Send a POSIX signal to the window"),
+    ("tag", "window.tag", "tag", False, "Tag the window"),
+    ("deny from group", "window.deny_from_group", "window", False, "Keep the window out of a group"),
+    # --- workspace
+    ("move to workspace", "workspace.move", "workspace", False, "Move the window to a workspace"),
+    ("rename workspace", "workspace.rename", "name", False, "Rename a workspace"),
+    ("change workspace id", "workspace.change_id", "id", False, "Renumber the current workspace"),
+    ("special workspace", "workspace.toggle_special", "name", False, "Toggle a special workspace"),
+    ("swap monitors", "workspace.swap_monitors", "monitor1", False, "Swap two monitors' workspaces"),
+    # --- focus
+    ("focus", "focus", "direction", False, "Move focus: left, right, up, down or last"),
+    # --- group
+    ("group: toggle", "group.toggle", None, False, "Toggle grouping on the focused window"),
+    ("group: next", "group.next", None, False, "Switch to the next window in the group"),
+    ("group: prev", "group.prev", None, False, "Switch to the previous window in the group"),
+    ("group: active", "group.active", "index", False, "Switch to a window in the group by index"),
+    ("group: lock", "group.lock", None, False, "Lock the group"),
+    ("group: lock active", "group.lock_active", None, False, "Lock the active group"),
+    ("group: move window", "group.move_window", "direction", False, "Move a window within the group"),
+    # --- cursor
+    ("cursor: move", "cursor.move", "x", False, "Move the cursor to an x coordinate"),
+    ("cursor: corner", "cursor.move_to_corner", "corner", False, "Move the cursor to a window corner [0-3]"),
+    # --- plain-string dispatchers: called as hl.dsp.foo("value")
+    ("exec", "exec_cmd", None, True, "Run a shell command"),
+    ("exec raw", "exec_raw", None, True, "Run a command without a shell"),
+    ("layout message", "layout", "value", True, "Send a layout message, e.g. master"),
+    ("submap", "submap", "value", True, "Move to a submap"),
+    ("global shortcut", "global", "value", True, "Activate a D-Bus global shortcut"),
+    ("event", "event", "value", True, "Send an event to socket2"),
+    # --- numeric
+    ("force idle", "force_idle", "seconds", True, "Force idle timers (idle only, not keybinds)"),
+    # --- misc
+    ("dpms", "dpms", None, False, "Toggle monitors (idle only, not keybinds)"),
+    ("force renderer reload", "force_renderer_reload", None, False, "Force reload the renderer"),
+    ("release input capture", "release_input_capture", None, False, "End an input capture session"),
+    ("send shortcut", "send_shortcut", "key", False, "Forward a shortcut to the focused window"),
+    ("send key state", "send_key_state", "state", False, "Send a key with explicit down/up state"),
+    ("pass", "pass", "window", False, "Let the shortcut pass through to the window"),
+    ("no-op", "no_op", None, False, "Do nothing; useful for conditional binds"),
+    ("exit Hyprland", "exit", None, False, "Quit Hyprland (prefer hyprshutdown)"),
+]
+
+# hyprland.conf spelling for the same actions, for pre-0.56 configs. Those use a
+# flat name, e.g. "closewindow" rather than hl.dsp.window.close().
+#
+# Caveat: the names below are the documented legacy spellings. A Hyprland new
+# enough to run this app has removed the legacy parser entirely, so they cannot
+# be verified from a 0.56+ install - only a pre-0.56 machine can confirm them.
+# UNVERIFIED_CONF marks the ones that are most likely to have drifted.
+UNVERIFIED_CONF = {
+    "window.pin", "window.clear_tags", "window.pseudo", "window.signal",
+    "window.tag", "window.deny_from_group", "group.next", "group.prev",
+    "workspace.change_id", "workspace.swap_monitors", "global",
+}
+CONF_DISPATCHERS = {
+    "window.close": "closewindow", "window.kill": "killactive",
+    "window.fullscreen": "fullscreen", "window.float": "togglefloating",
+    "window.move": "movewindow", "window.resize": "resizeactive",
+    "window.swap": "swapwindow", "window.pin": "pin",
+    "window.center": "centerwindow", "window.cycle_next": "cyclenext",
+    "window.bring_to_top": "bringactivetotop",
+    "window.alter_zorder": "alterzorder", "window.clear_tags": "cleartags",
+    "window.drag": "beginmove", "window.pseudo": "pseudo",
+    "window.toggle_swallow": "toggleswallow", "window.set_prop": "setprop",
+    "window.signal": "signalwindow", "window.tag": "tagwindow",
+    "window.deny_from_group": "denywindowfromgroup", "window.pin": "pin",
+    "window.clear_tags": "cleartags",
+    "workspace.move": "movetoworkspace", "workspace.rename": "renameworkspace",
+    "workspace.change_id": "changeactiveworkspace",
+    "workspace.toggle_special": "togglespecialworkspace",
+    "workspace.swap_monitors": "swapmonitors",
+    "focus": "focuswindow",
+    "group.toggle": "togglegroup", "group.next": "nextfocusedgroup",
+    "group.prev": "prevfocusedgroup", "group.active": "activewindow",
+    "group.lock": "lockgroups", "group.lock_active": "lockgroups",
+    "group.move_window": "movewindow",
+    "cursor.move": "movecursor", "cursor.move_to_corner": "movecursortocorner",
+    "exec_cmd": "exec", "exec_raw": "exec", "layout": "layout", "submap": "submap",
+    "send_shortcut": "sendshortcut", "send_key_state": "sendkeystate",
+    "global": "globalshortcut", "event": "event", "dpms": "dpms",
+    "force_idle": "forceidle",
+    "force_renderer_reload": "forcerendererreload",
+    "release_input_capture": "releaseinputcapture", "pass": "pass",
+    "no_op": "pass", "exit": "exit",
+}
+
+# Arguments the GUI offers as one click, where the set is small and fixed.
+# Keyed by the DISPATCHERS display name. A dispatcher with an arg key but no
+# entry here would emit a bare hl.dsp.foo() and be rejected by the compositor,
+# so the test suite asserts every one is present.
+ARG_SUGGESTIONS = {
+    "focus": ["left", "right", "up", "down", "last", "urgent_or_last", "e-1", "e+1"],
+    "move": ["left", "right", "up", "down"],
+    "swap": ["left", "right", "up", "down"],
+    "fullscreen": ["maximized", "fullscreen", "none"],
+    "float": ["toggle", "enable", "disable"],
+    "resize": ["40", "80", "120", "200"],
+    "alter zorder": ["top", "bottom"],
+    "pin": ["activewindow"],
+    "clear tags": ["activewindow"],
+    "deny from group": ["activewindow"],
+    "pseudo": ["true", "false"],
+    "pass": ["activewindow"],
+    "set prop": ["alpha", "no_border", "noblur"],
+    "signal": ["15", "1", "9"],
+    "tag": ["1", "2", "3"],
+    "move to workspace": ["1", "2", "3", "4", "5", "e-1", "e+1"],
+    "rename workspace": ["scratch", "web", "code"],
+    "change workspace id": ["1", "2", "3", "4", "5"],
+    "special workspace": ["magic", "scratch"],
+    "swap monitors": ["HDMI-A-1", "eDP-1"],
+    "group: active": ["1", "2", "3", "4"],
+    "group: move window": ["left", "right", "up", "down"],
+    "cursor: move": ["0", "500", "1000"],
+    "cursor: corner": ["0", "1", "2", "3"],
+    "layout message": ["master", "dwindle", "monocle"],
+    "submap": ["scratch"],
+    "global shortcut": ["__default"],
+    "event": ["x"],
+    "force idle": ["1", "60", "300"],
+    "send shortcut": ["a", "Return", "Tab"],
+    "send key state": ["down", "up"],
+}
+
+# Numeric arguments: written as a Lua number, not a quoted string.
+NUMERIC_ARGS = {"x", "corner", "group", "seconds", "id", "y", "dx", "dy"}
+
+# Several dispatchers require more keys than the single argument the GUI asks
+# for. Rather than hide them, we supply a default for the companion key and let
+# the user set the one that matters. Verified against the running compositor:
+# each of these errors with "X is required" when its companion is missing.
+COMPANION_ARGS = {
+    "window.resize": {"y": "0"},
+    "pass": {},
+    "window.set_prop": {"value": '"1"'},
+    "workspace.move": {"monitor": '""'},
+    "workspace.rename": {"workspace": '""'},
+    "workspace.change_id": {"workspace": '""'},
+    "workspace.swap_monitors": {"monitor2": '""'},
+    "cursor.move": {"y": "0"},
+    "send_shortcut": {"mods": '""'},
+    "send_key_state": {"mods": '""', "key": '"a"'},
+    "force_idle": {},
+}
+
+# Suffixes that mark a command as a screenshot/audio/launch helper rather than
+# something a user would bind to a bare key.
+_CMD_SKIP_SUFFIX = (".so", ".pyc", ".png", ".jpg", ".svg", ".desktop", ".1", ".2")
+
+
+def scan_commands():
+    """Every executable on this machine's PATH that looks bindable.
+
+    Scanned rather than bundled: the useful list is exactly what this user can
+    actually run, and it differs per machine.
+    """
+    found = set()
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if not directory or not os.path.isdir(directory):
+            continue
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            continue
+        for name in entries:
+            if name.startswith(".") or name.endswith(_CMD_SKIP_SUFFIX):
+                continue
+            path = os.path.join(directory, name)
+            if not os.access(path, os.X_OK) or not os.path.isfile(path):
+                continue
+            # Skip anything with an extension: those are libraries, not commands.
+            if "." in name:
+                continue
+            found.add(name)
+    return sorted(found)
 
 
 # --------------------------------------------------------------------------
@@ -324,8 +530,7 @@ def emit_conf(state):
         out.append(f"unbind = {key}")
 
     for b in state.get("binds", []):
-        out.append(f'bind = {b["keys"]}, exec, {b.get("command") or ""}, '
-                   f'{b.get("description") or ""}')
+        out.append(conf_bind_line(b))
 
     out.append(f"windowrulev2 = float enabled, 1, class, {APP_CLASS}")
     out.append("windowrulev2 = size 1000 820, 1, class, " + APP_CLASS)
@@ -389,6 +594,56 @@ def _preamble():
     ]
 
 
+def disp_lookup(display):
+    """(call path, arg key, plain, description) for a display name, or None."""
+    for name, path, key, plain, desc in DISPATCHERS:
+        if name == display:
+            return path, key, plain, desc
+    return None
+
+
+def bind_dispatcher(b):
+    """(lua path, arg key, plain, value) for a saved binding.
+
+    An unknown or absent dispatcher falls back to exec, which is what the GUI
+    wrote before the dispatcher dropdown existed.
+    """
+    found = disp_lookup(b.get("dispatcher") or "")
+    if found is None:
+        return "exec_cmd", None, True, b.get("command") or ""
+    path, key, plain, _desc = found
+    if path in ("exec_cmd", "exec_raw"):
+        return path, key, True, b.get("command") or ""
+    return path, key, plain, b.get("arg") or ""
+
+
+def lua_bind_line(b):
+    desc = lua_value(b.get("description") or "")
+    path, key, plain, value = bind_dispatcher(b)
+    if not value and not plain:
+        return f'o.bind({lua_value(b["keys"])}, {desc}, hl.dsp.{path}())'
+    if plain:
+        if key in NUMERIC_ARGS and value.lstrip("-").isdigit():
+            lit = value
+        else:
+            lit = lua_value(value)
+        return f'o.bind({lua_value(b["keys"])}, {desc}, hl.dsp.{path}({lit}))' 
+    if key in NUMERIC_ARGS and value.lstrip("-").isdigit():
+        lit = value
+    else:
+        lit = lua_value(value)
+    extra = "".join(f", {k} = {v}" for k, v in COMPANION_ARGS.get(path, {}).items()
+                     if k != key)
+    return (f'o.bind({lua_value(b["keys"])}, {desc}, '
+            f'hl.dsp.{path}({{ {key} = {lit}{extra} }}))')
+
+
+def conf_bind_line(b):
+    path, _key, _plain, value = bind_dispatcher(b)
+    disp = CONF_DISPATCHERS.get(path, path)
+    return f'bind = {b["keys"]}, {disp}, {value}, {b.get("description") or ""}'
+
+
 def build_lua(state):
     chunks = _preamble()
 
@@ -408,9 +663,7 @@ def build_lua(state):
         chunks.append(f"hl.unbind({lua_value(key)})")
 
     for b in state.get("binds", []):
-        desc = lua_value(b.get("description") or "")
-        cmd = lua_value(b.get("command") or "")
-        chunks.append(f'o.bind({lua_value(b["keys"])}, {desc}, {cmd})')
+        chunks.append(lua_bind_line(b))
 
     if len(chunks) == len(_preamble()):
         chunks.append("-- (no settings changed yet)")
@@ -630,6 +883,82 @@ class SettingRow:
 # --------------------------------------------------------------------------
 
 MOD_ORDER = ["SUPER", "CTRL", "SHIFT", "ALT"]
+
+
+class CommandEntry(Gtk.Box):
+    """Search box plus a dropdown of every command found on this machine.
+
+    Gtk.EntryCompletion is deprecated in GTK4, so this is a Gtk.DropDown fed by
+    a Gtk.StringList. Gtk.FilterListModel cannot be constructed from Python, so
+    typing rebuilds the (much smaller) list rather than filtering a big one in
+    place. Rebuilding 3k strings is imperceptible and keeps this simple.
+    """
+
+    NONE = "(none)"
+
+    def __init__(self, commands, placeholder="Search commands on your PATH"):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.commands = list(commands)
+        self.visible = [self.NONE] + self.commands
+
+        self.search = Gtk.SearchEntry(placeholder_text=placeholder)
+        self.search.connect("search-changed", self._on_search)
+        self.append(self.search)
+
+        self.dropdown = Gtk.DropDown(model=self._model())
+        self.dropdown.set_hexpand(True)
+        self.append(self.dropdown)
+
+    @staticmethod
+    def _matches(text, needle):
+        """Subsequence match, so "ocs" finds omarchy-capture-screenshot."""
+        if not needle:
+            return True
+        pos = 0
+        for ch in text.lower():
+            if pos < len(needle) and ch == needle[pos]:
+                pos += 1
+        return pos == len(needle)
+
+    def _model(self):
+        store = Gtk.StringList()
+        for c in self.visible:
+            store.append(c)
+        return store
+
+    def _on_search(self, entry):
+        needle = entry.get_text().strip().lower()
+        self.visible = [self.NONE] + [c for c in self.commands
+                                      if self._matches(c, needle)]
+        # The list is rebuilt, so the old selection index no longer means the
+        # same thing; reset it.
+        self.dropdown.set_model(self._model())
+        self.dropdown.set_selected(0)
+
+    def set_commands(self, commands):
+        self.commands = list(commands)
+        self.search.set_text("")
+        self.visible = [self.NONE] + self.commands
+        self.dropdown.set_model(self._model())
+        self.dropdown.set_selected(0)
+
+    def value(self):
+        item = self.dropdown.get_selected_item()
+        if item is None:
+            return ""
+        text = item.get_string()
+        return "" if text == self.NONE else text
+
+    def set_value(self, text):
+        self.search.set_text("")
+        if not text:
+            self.set_commands(self.commands)
+            return
+        # Narrow to just the match so set_selected lands on the right row.
+        if text in self.commands:
+            self.visible = [self.NONE, text]
+            self.dropdown.set_model(self._model())
+            self.dropdown.set_selected(1)
 
 
 class KeyEntry(Gtk.Box):
@@ -888,6 +1217,17 @@ class HyprGuiWindow(Adw.ApplicationWindow):
         group.add(row)
         return group
 
+    @staticmethod
+    def _caption_label():
+        """A dim, wrapping caption line that a PreferencesGroup can hold."""
+        label = Gtk.Label(xalign=0, wrap=True)
+        label.add_css_class("dim-label")
+        label.add_css_class("caption")
+        label.set_margin_start(12)
+        label.set_margin_end(12)
+        label.set_margin_bottom(4)
+        return label
+
     def _build_binds_page(self):
         prefs, title = self.new_page("Keybindings")
 
@@ -902,11 +1242,45 @@ class HyprGuiWindow(Adw.ApplicationWindow):
         prefs.add(group)
 
         add = Adw.PreferencesGroup(title="Add a binding")
+        add.set_description(
+            "Pick what the shortcut does, then record the keys. Your binding is "
+            "written last, so it overrides any inherited binding for the same keys.")
+
         row = Adw.ActionRow(title="Shortcut")
         self.new_key = KeyEntry()
         self.new_key.set_size_request(320, -1)
         row.add_suffix(self.new_key)
         row.set_activatable_widget(self.new_key.entry)
+        add.add(row)
+
+        # --- dispatcher dropdown
+        self.disp_combo = Adw.ComboRow(title="Action")
+        model = Gtk.StringList()
+        model.append("Run a command…")
+        for name, _path, _key, _plain, _desc in DISPATCHERS:
+            model.append(name)
+        self.disp_combo.set_model(model)
+        self.disp_combo.connect("notify::selected", lambda *_: self._disp_changed())
+        add.add(self.disp_combo)
+        self._disp_desc = self._caption_label()
+        add.add(self._disp_desc)
+
+        # --- argument box, shown only for dispatchers that take one
+        self.arg_combo = Adw.ComboRow(title="Argument")
+        self.arg_model = Gtk.StringList()
+        self.arg_combo.set_model(self.arg_model)
+        self.arg_combo.connect("notify::selected", lambda *_: self._sync_cmd())
+        add.add(self.arg_combo)
+
+        self.arg_entry = Adw.EntryRow(title="Argument")
+        self.arg_entry.connect("changed", lambda *_: self._sync_cmd())
+        add.add(self.arg_entry)
+
+        # --- command autocomplete
+        row = Adw.ActionRow(title="Command")
+        self.cmd_box = CommandEntry(scan_commands())
+        self.cmd_box.set_size_request(320, -1)
+        row.add_suffix(self.cmd_box)
         add.add(row)
 
         row = Adw.ActionRow(title="Description")
@@ -916,17 +1290,14 @@ class HyprGuiWindow(Adw.ApplicationWindow):
         row.set_activatable_widget(self.new_desc)
         add.add(row)
 
-        row = Adw.ActionRow(title="Command")
-        self.new_cmd = Gtk.Entry(valign=Gtk.Align.CENTER, width_chars=28)
-        self.new_cmd.set_placeholder_text("omarchy-capture-screenshot")
-        row.add_suffix(self.new_cmd)
-        row.set_activatable_widget(self.new_cmd)
-        add.add(row)
+        self.cmd_hint = self._caption_label()
+        add.add(self.cmd_hint)
 
         btn = Gtk.Button(label="Add binding", halign=Gtk.Align.START)
         btn.add_css_class("suggested-action")
         btn.connect("clicked", lambda *_: self.add_bind())
         add.add(btn)
+        self._disp_changed()
         prefs.add(add)
 
         ub = Adw.PreferencesGroup(
@@ -975,26 +1346,94 @@ class HyprGuiWindow(Adw.ApplicationWindow):
             box.append(row)
             return
         for i, b in enumerate(binds):
-            row = Adw.ActionRow(title=b["keys"], subtitle=b.get("description") or b.get("command", ""))
+            path, _key, arg, cmd = bind_dispatcher(b)
+            what = (cmd or arg) if path in ("exec_cmd", "exec_raw") else (
+                path + (f" {arg}" if arg else ""))
+            row = Adw.ActionRow(title=b["keys"], subtitle=what)
+            if b.get("description"):
+                row.set_subtitle(f'{b["description"]}  ·  {what}')
             del_btn = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER)
             del_btn.add_css_class("flat")
             del_btn.connect("clicked", lambda _b, idx=i: self.remove_bind(idx))
             row.add_suffix(del_btn)
             box.append(row)
 
+    def _selected_dispatcher(self):
+        """("exec", None, None) for the command row, else (path, key, desc)."""
+        i = self.disp_combo.get_selected()
+        if i <= 0:
+            return "exec_cmd", "cmd", None
+        _name, path, key, _plain, desc = DISPATCHERS[i - 1]
+        return path, key, desc
+
+    def _disp_changed(self):
+        path, key, desc = self._selected_dispatcher()
+        is_exec = path in ("exec_cmd", "exec_raw")
+        self.cmd_box.set_visible(is_exec)
+        self._disp_desc.set_text("Type any command; it runs through a shell."
+                                 if is_exec else desc)
+
+        display = self._current_display()
+        suggestions = ARG_SUGGESTIONS.get(display, [])
+        takes_arg = key is not None
+        self.arg_combo.set_visible(takes_arg and bool(suggestions))
+        self.arg_entry.set_visible(takes_arg and not suggestions)
+        if takes_arg and suggestions:
+            model = Gtk.StringList()
+            for s in suggestions:
+                model.append(s)
+            self.arg_combo.set_model(model)
+            self.arg_model = model
+        self._sync_cmd()
+
+    def _current_display(self):
+        i = self.disp_combo.get_selected()
+        return DISPATCHERS[i - 1][0] if i > 0 else "exec"
+
+    def _current_arg(self):
+        path, key, _desc = self._selected_dispatcher()
+        if key is None:
+            return ""
+        display = self._current_display()
+        if ARG_SUGGESTIONS.get(display):
+            i = self.arg_combo.get_selected()
+            return ARG_SUGGESTIONS[display][i] if 0 <= i < len(ARG_SUGGESTIONS[display]) else ""
+        return self.arg_entry.get_text().strip()
+
+    def _sync_cmd(self):
+        path, key, _desc = self._selected_dispatcher()
+        if path in ("exec_cmd", "exec_raw"):
+            n = len(self.cmd_box.commands)
+            self.cmd_hint.set_text(f"{n} commands found on your PATH")
+        else:
+            self.cmd_hint.set_text("")
+
     def add_bind(self):
         keys = self.new_key.value()
         if not keys:
             self.notify("Record a shortcut first")
             return
+        path, key, _desc = self._selected_dispatcher()
+        is_exec = path in ("exec_cmd", "exec_raw")
+        arg = self._current_arg()
+        command = self.cmd_box.value() if is_exec else ""
+        if is_exec and not command:
+            self.notify("Enter a command to run")
+            return
+        if not is_exec and key is not None and not arg:
+            self.notify(f"{self._current_display()} needs an argument")
+            return
+
         self.state["binds"].append({
             "keys": keys,
             "description": self.new_desc.get_text().strip(),
-            "command": self.new_cmd.get_text().strip(),
+            "command": command,
+            "dispatcher": self._current_display(),
+            "arg": arg,
         })
         self.new_key.set_value("")
         self.new_desc.set_text("")
-        self.new_cmd.set_text("")
+        self.cmd_box.set_value("")
         self._rebuild_binds()
         self.mark_dirty()
 
@@ -1093,7 +1532,7 @@ class HyprGuiWindow(Adw.ApplicationWindow):
         self.status.set_description(
             f"{n} GUI-managed setting(s) written to {gen_file()}.\n"
             "Press the reload button (top right) to apply them now.")
-        self.tabs.set_selected_page(self.tabs.get_n_pages() - 1)
+        self.tabs.set_selected_page(self.tabs.get_nth_page(self.tabs.get_n_pages() - 1))
 
     def reload_clicked(self):
         ensure_required()
