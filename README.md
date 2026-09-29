@@ -93,9 +93,10 @@ The live half skips itself with a message if no Hyprland session is reachable.
 
 ## Limitations
 
-- The `.conf` backend is checked structurally, not parsed: a Hyprland new
-  enough to run this app uses Lua and cannot parse `.conf` at all. Run the
-  tests on a pre-0.56 machine to exercise it end to end.
+- The `.conf` backend is checked structurally, not parsed: Hyprland 0.56+ uses
+  Lua and cannot parse `.conf` at all, so the author had no parser to test
+  against. If you run a pre-0.56 release, please run the test suite and open an
+  issue if the live half fails — that path is the least proven part of this.
 - Options your Hyprland build doesn't have are greyed out rather than hidden,
   so you can see what exists on that version.
 - Monitor scale is quantized by the compositor; hypr-gui re-reads the value
