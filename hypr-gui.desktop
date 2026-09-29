@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Hyprland Settings
+GenericName=Window Manager Settings
+Comment=Edit Hyprland config, displays and keybindings graphically
+Exec=hypr-gui
+Icon=preferences-desktop-display
+Terminal=false
+Categories=Settings;DesktopSettings;System;
+Keywords=hyprland;hypr;wm;compositor;gaps;keybind;
