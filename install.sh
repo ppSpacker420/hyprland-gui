@@ -1,5 +1,9 @@
 #!/bin/bash
 # Install hypr-gui into ~/.local. No root, no system files touched.
+#
+# NOTE: this script and the app it installs were written by an AI coding
+# assistant in a single session and never reviewed by a human. Read them
+# first. See README.md.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

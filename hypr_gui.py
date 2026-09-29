@@ -1,10 +1,20 @@
 #!/usr/bin/python3
-"""hypr-gui — a graphical settings editor for this machine's Hyprland (Lua config).
+"""hypr-gui - a graphical settings editor for Hyprland.
 
-Reads live values from the compositor, lets you change them, and writes your
-changes into ~/.config/hypr/hyprgui.lua, which is generated from
-~/.config/hypr/.hypr-gui-state.json. Only settings you actually touch are
-written, so Omarchy defaults and your hand-written files keep working.
+  ##########################################################################
+  # THIS FILE WAS WRITTEN BY AN AI CODING ASSISTANT (Claude, via Hermes    #
+  # Agent) IN A SINGLE SESSION. NO HUMAN WROTE OR REVIEWED IT.               #
+  #                                                                         #
+  # It edits your window manager's config. Read it before you run it.       #
+  # The .conf backend has never been parsed by a real Hyprland.             #
+  # See README.md for the full caveats.                                     #
+  ##########################################################################
+
+Read current values from the compositor, let you change them, and write your
+changes into ~/.config/hypr/hyprgui.lua (or hyprgui.conf on pre-0.56
+Hyprland), which is generated from ~/.config/hypr/.hypr-gui-state.json. Only
+settings you actually touch are written, so distro defaults and your
+hand-written files keep working.
 """
 
 import json
