@@ -11,14 +11,16 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
+import time
 from pathlib import Path
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
 HYPR_DIR = Path.home() / ".config" / "hypr"
 STATE_FILE = HYPR_DIR / ".hypr-gui-state.json"
@@ -248,36 +250,240 @@ COMPANION_ARGS = {
     "force_idle": {},
 }
 
-# Suffixes that mark a command as a screenshot/audio/launch helper rather than
-# something a user would bind to a bare key.
-_CMD_SKIP_SUFFIX = (".so", ".pyc", ".png", ".jpg", ".svg", ".desktop", ".1", ".2")
+# Extensions that mark a file as a library, data blob or asset rather than
+# something a person would bind to a key.
+_NON_COMMAND_SUFFIX = (
+    ".so", ".a", ".o", ".ko", ".pyc", ".pyo", ".pyd",
+    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".bmp",
+    ".desktop", ".json", ".yaml", ".yml", ".toml", ".conf", ".cfg", ".ini",
+    ".txt", ".md", ".html", ".css", ".js.map", ".map", ".pak", ".bin",
+    ".ttf", ".otf", ".woff", ".woff2", ".mp3", ".wav", ".flac", ".mp4",
+    ".iso", ".deb", ".rpm", ".jar", ".whl", ".tar", ".gz", ".xz", ".zip",
+    ".service", ".socket", ".timer", ".rules", ".conf.d",
+)
 
 
-def scan_commands():
-    """Every executable on this machine's PATH that looks bindable.
+def _looks_like_command(name):
+    """True if an executable filename is plausibly something a user would run.
 
-    Scanned rather than bundled: the useful list is exactly what this user can
-    actually run, and it differs per machine.
+    Extension-bearing names are not automatically rejected: fsck.btrfs,
+    alsa-info.sh and ldconfig.noconf are all real commands. What gets dropped
+    is anything matching a known data/library suffix, and versioned duplicates
+    like aclocal-1.18 whose unversioned twin is also present.
     """
-    found = set()
-    for directory in os.environ.get("PATH", "").split(os.pathsep):
-        if not directory or not os.path.isdir(directory):
+    if name.startswith("."):
+        return False
+    lowered = name.lower()
+    for suffix in _NON_COMMAND_SUFFIX:
+        if lowered.endswith(suffix):
+            return False
+    # Versioned shared objects: libfoo.so.1, libc.so.6
+    if ".so." in lowered:
+        return False
+    # Bare interpreters and loaders are not commands.
+    if lowered in ("sh", "bash", "zsh", "python", "python3", "node", "ruby",
+                   "perl", "env", "yes", "true", "false", "test", "["):
+        return False
+    return True
+
+
+def _strip_version_suffix(name):
+    """'aclocal-1.18' -> 'aclocal'; 'python3.12' -> 'python3'. None if not versioned."""
+    for sep in ("-", "."):
+        if sep not in name:
             continue
+        head, _, tail = name.rpartition(sep)
+        if head and tail and all(c.isdigit() or c == "." for c in tail):
+            return head
+    return None
+
+
+# Programs that launch another program rather than being one.
+_EXEC_WRAPPERS = ("env", "sh", "bash", "zsh", "nohup", "setsid", "flatpak",
+                  "snap", "dbus-run-session", "systemd-run", "gtk-launch",
+                  "kde-open", "xdg-open", "exo-open", "gio", "kioclient",
+                  "command", "exec", "time", "nice", "stdbuf", "ionice")
+
+
+def _scan_path_dir(directory, found):
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return
+    for name in entries:
+        if not _looks_like_command(name):
+            continue
+        path = os.path.join(directory, name)
         try:
-            entries = os.listdir(directory)
+            if not (os.access(path, os.X_OK) and os.path.isfile(path)):
+                continue
         except OSError:
             continue
-        for name in entries:
-            if name.startswith(".") or name.endswith(_CMD_SKIP_SUFFIX):
+        found.add(name)
+
+
+def _desktop_dirs():
+    """Where .desktop files live, including Flatpak and Snap exports."""
+    return [
+        Path.home() / ".local/share/applications",
+        Path("/usr/share/applications"),
+        Path("/var/lib/flatpak/exports/share/applications"),
+        Path.home() / ".local/share/flatpak/exports/share/applications",
+        Path("/var/lib/snapd/desktop/applications"),
+    ]
+
+
+def _desktop_exec(entry):
+    """The binary a .desktop file launches, or None.
+
+    Unwraps launchers, so "env FOO=bar /usr/bin/app --flag" yields "app". For
+    "sh -c 'some app'" there is no real binary to name, so this returns None
+    rather than the "-c" flag.
+    """
+    try:
+        text = entry.read_text(errors="replace")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        if not line.startswith("Exec="):
+            continue
+        parts = line[5:].split()
+        while parts:
+            head = os.path.basename(parts[0])
+            if head not in _EXEC_WRAPPERS:
+                break
+            if head == "env":
+                # Drop VAR=value assignments, keep looking for the binary.
+                while len(parts) > 1 and "=" in parts[1] and "/" not in parts[1]:
+                    parts.pop(1)
+            elif head in ("sh", "bash", "zsh", "dash", "ksh"):
+                # `sh -c "cmd"` names a shell string, not a binary.
+                return None
+            elif head in ("flatpak", "snap"):
+                # `flatpak run com.example.App` runs the app, but the only
+                # name we can offer is flatpak/snap itself.
+                return head
+            else:
+                # nohup, setsid, nice ... take flags then the real binary.
+                while len(parts) > 1 and parts[1].startswith("-"):
+                    parts.pop(1)
+            parts.pop(0)
+        if not parts:
+            return None
+        binary = os.path.basename(parts[0])
+        # A leading flag means we unwrapped into nothing runnable.
+        if binary.startswith("-"):
+            return None
+        return binary
+    return None
+
+
+def _scan_desktop_entries(found):
+    """Add GUI apps that have no CLI, by their Exec= command.
+
+    Flatpak and Snap apps are installed this way, so without this they would be
+    invisible to a PATH scan.
+    """
+    for base in _desktop_dirs():
+        try:
+            entries = list(base.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.suffix != ".desktop":
                 continue
-            path = os.path.join(directory, name)
-            if not os.access(path, os.X_OK) or not os.path.isfile(path):
+            binary = _desktop_exec(entry)
+            if binary and _looks_like_command(binary):
+                found.add(binary)
+
+
+def _scan_shell_functions(found):
+    """Add aliases and shell functions defined in the user's rc files.
+
+    These are runnable but are not files, so a PATH scan cannot see them. This
+    is a static read of the rc files, not a parse of a live shell: it will miss
+    anything generated at runtime, and it deliberately does not expand or
+    evaluate anything it finds.
+    """
+    for rc in (".bashrc", ".zshrc", ".bash_profile", ".profile",
+               ".config/fish/config.fish"):
+        path = Path.home() / rc
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
                 continue
-            # Skip anything with an extension: those are libraries, not commands.
-            if "." in name:
+
+            if line.startswith("alias "):
+                # alias name='body'  or  alias name="body"  or  alias name=bare
+                name = line[len("alias "):].split("=")[0].strip()
+            elif line.startswith("function "):
+                # function name() { ... }   and   function name { ... }
+                rest = line[len("function "):]
+                name = rest.split("(")[0].split("{")[0].strip()
+            else:
                 continue
+
+            if not name or not _looks_like_command(name):
+                continue
+            # An alias body can be anything, including spaces; only the name
+            # is a command, so that is all we keep.
             found.add(name)
-    return sorted(found)
+
+
+def scan_commands(include_desktop=True, include_shell=True):
+    """Every command this machine can actually run.
+
+    Scanned rather than bundled so the list is right on any machine: the set of
+    usable commands differs completely between distros, and a shipped list
+    would be wrong everywhere except the author's box. Sources:
+
+      1. every executable on $PATH
+      2. GUI apps from .desktop entries (Flatpak, Snap), which have no CLI
+      3. shell aliases and functions from the user's rc files
+
+    A ~2 minute result is cached under XDG cache dir because scanning is slow
+    enough to be noticeable at startup.
+    """
+    cache = Path(os.environ.get("XDG_CACHE_HOME",
+                                Path.home() / ".cache")) / "hypr-gui"
+    cache_file = cache / "commands.json"
+    try:
+        if cache_file.exists() and time.time() - cache_file.stat().st_mtime < 7200:
+            data = json.loads(cache_file.read_text())
+            if isinstance(data, list) and data:
+                return sorted(set(data))
+    except (OSError, json.JSONDecodeError):
+        pass
+
+    found = set()
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        if directory and os.path.isdir(directory):
+            _scan_path_dir(directory, found)
+
+    # A versioned build tool (aclocal-1.18) is noise if the plain one exists.
+    versioned = set()
+    for name in found:
+        base = _strip_version_suffix(name)
+        if base and base != name and base in found:
+            versioned.add(name)
+    found -= versioned
+
+    if include_desktop:
+        _scan_desktop_entries(found)
+    if include_shell:
+        _scan_shell_functions(found)
+
+    result = sorted(found)
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        cache_file.write_text(json.dumps(result))
+    except OSError:
+        pass
+    return result
 
 
 # --------------------------------------------------------------------------
@@ -962,76 +1168,202 @@ class CommandEntry(Gtk.Box):
 
 
 class KeyEntry(Gtk.Box):
-    """Entry that records a key combination when clicked."""
+    """A large press-to-record area, plus a box to type a combination.
 
-    def __init__(self, placeholder="Click, then press keys"):
-        super().__init__(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    The capture area is deliberately big: pressing keys is the main interaction
+    here, and a one-line text field is a poor target for it. Click anywhere on
+    the area to arm it, press the combination, and it displays what it caught.
+
+    * a lone modifier shows as "SUPER + ..." and keeps listening
+    * bare keys are allowed, so "Q" is a valid shortcut
+    * Backspace clears and keeps listening, Escape cancels
+    * the entry below stays editable for typing super+shift+r or super-r
+    """
+
+    IDLE = "Click here, then press your shortcut"
+
+    def __init__(self, placeholder=None):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self.recording = False
         self.mods = set()
-        self.keyval = 0
         self.keyval_name = ""
+        self.placeholder_text = placeholder or self.IDLE
 
-        self.entry = Gtk.Entry(hexpand=True, placeholder_text=placeholder)
-        self.entry.set_text(placeholder)
-        self.entry.set_editable(False)
-        self.rec_btn = Gtk.ToggleButton(icon_name="input-keyboard-symbolic",
-                                        tooltip_text="Record a key combination")
-        self.rec_btn.connect("toggled", self._toggle)
+        # --- the large capture area
+        self.button = Gtk.Button()
+        self.button.set_size_request(340, 96)
+        self.button.add_css_class("key-capture")
+        self.button.set_tooltip_text("Click, then press your key combination")
+        self.button.connect("clicked", self._on_clicked)
+        self.append(self.button)
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        box.set_valign(Gtk.Align.CENTER)
+        box.set_vexpand(True)
+
+        self.big_label = Gtk.Label(xalign=0.5, yalign=0.5)
+        self.big_label.add_css_class("key-capture-label")
+        self.big_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.big_label.set_text(self.placeholder_text)
+        box.append(self.big_label)
+
+        self.hint = Gtk.Label(xalign=0.5)
+        self.hint.add_css_class("dim-label")
+        self.hint.add_css_class("caption")
+        self.hint.set_text("e.g. SUPER + SHIFT + R")
+        box.append(self.hint)
+
+        self.button.set_child(box)
+
+        # --- the typing fallback
+        self.entry = Gtk.Entry(hexpand=True, placeholder_text="…or type it: SUPER + SHIFT + R")
+        self.entry.add_css_class("monospace")
         self.append(self.entry)
-        self.append(self.rec_btn)
 
-        ctrl = Gtk.EventControllerKey()
-        ctrl.connect("key-pressed", self._key_pressed)
-        self.entry.add_controller(ctrl)
+        # A Gtk.EventControllerKey can only ever be attached to one widget, so
+        # the button and the entry each get their own.
+        for target in (self.button, self.entry):
+            ctrl = Gtk.EventControllerKey()
+            ctrl.connect("key-pressed", self._key_pressed)
+            target.add_controller(ctrl)
 
-    def value(self):
-        if self.keyval_name and (self.mods or not self.keyval_name.isalnum()):
+        self.entry.connect("changed", self._on_typed)
+
+    # -- display ------------------------------------------------------------
+
+    def _refresh(self):
+        if self.recording:
+            shown = [m for m in MOD_ORDER if m in self.mods]
+            self.big_label.set_text(" + ".join(shown) + " + ..." if shown else "Press keys…")
+            self.hint.set_text("Escape cancels · Backspace clears")
+            return
+        text = self._raw()
+        if text:
+            self.big_label.set_text(text)
+            self.hint.set_text("click the box to record a different one")
+        else:
+            self.big_label.set_text(self.placeholder_text)
+            self.hint.set_text("e.g. SUPER + SHIFT + R")
+
+    def _raw(self):
+        """The recorded combination, or the typed one, or empty."""
+        if self.keyval_name:
             parts = [m for m in MOD_ORDER if m in self.mods]
             parts.append(self.keyval_name)
             return " + ".join(parts)
-        return self.entry.get_text().strip()
+        text = self.entry.get_text().strip()
+        if not text or self.recording:
+            return ""
+        return self._normalise(text)
+
+    @staticmethod
+    def _normalise(text):
+        parts = [p.strip().upper()
+                 for p in text.replace("-", " + ").split("+") if p.strip()]
+        known = {"SUPER", "CTRL", "SHIFT", "ALT"}
+        # Modifiers first, in a fixed order, then the key.
+        ordered = [m for m in MOD_ORDER if m in parts]
+        ordered += [p for p in parts if p not in known]
+        return " + ".join(ordered)
+
+    # -- value --------------------------------------------------------------
+
+    def value(self):
+        return self._raw()
 
     def set_value(self, text):
+        self.stop_recording()
         self.keyval_name = ""
         self.mods = set()
-        self.entry.set_text(text)
+        self.entry.set_text(text or "")
+        self._refresh()
 
-    def _toggle(self, btn):
-        self.recording = btn.get_active()
+    # -- arming -------------------------------------------------------------
+
+    def _on_clicked(self, _btn):
         if self.recording:
-            self.mods = set()
-            self.keyval = 0
-            self.entry.set_text("Press keys…")
-            self.entry.grab_focus()
+            self.stop_recording()
+        else:
+            self.start_recording()
+        self._refresh()
 
-    def _key_pressed(self, _c, keyval, keycode, state):
+    def start_recording(self):
+        self.recording = True
+        self.mods = set()
+        self.keyval_name = ""
+        self.entry.set_text("")
+        self.button.add_css_class("recording")
+        # grab_focus() on a button that has not been mapped yet trips a
+        # Gdk-CRITICAL, and the window may not be realised in a headless run.
+        if self.button.get_mapped():
+            self.button.grab_focus()
+        self._refresh()
+
+    def stop_recording(self):
+        self.recording = False
+        self.button.remove_css_class("recording")
+        self._capture_typed()
+        self._refresh()
+
+    def _on_typed(self, entry):
+        if not self.recording:
+            self._refresh()
+
+    def _capture_typed(self):
+        """Fold a hand-typed combination into the recorded state."""
+        text = self.entry.get_text().strip()
+        if not text:
+            return
+        parts = [p.strip().upper()
+                 for p in text.replace("-", " + ").split("+") if p.strip()]
+        known = {"SUPER", "CTRL", "SHIFT", "ALT"}
+        mods = [p for p in parts if p in known]
+        keys = [p for p in parts if p not in known]
+        if not keys:
+            return
+        self.mods = set(mods)
+        self.keyval_name = keys[0]
+
+    # -- recording ----------------------------------------------------------
+
+    def _key_pressed(self, _c, keyval, _keycode, state):
         if not self.recording:
             return False
-        from gi.repository import Gdk
 
-        if keyval in (Gdk.KEY_Escape,):
-            self.rec_btn.set_active(False)
+        if keyval == Gdk.KEY_Escape:
             self.set_value("")
             return True
         if keyval in (Gdk.KEY_BackSpace, Gdk.KEY_Delete):
-            self.keyval_name = ""
             self.mods = set()
-            self.entry.set_text("—")
+            self.keyval_name = ""
+            self.entry.set_text("")
+            self._refresh()
             return True
-        mask = Gdk.ModifierType(0)
+
         for mod, bit in (("SUPER", Gdk.ModifierType.SUPER_MASK),
                          ("CTRL", Gdk.ModifierType.CONTROL_MASK),
                          ("SHIFT", Gdk.ModifierType.SHIFT_MASK),
                          ("ALT", Gdk.ModifierType.ALT_MASK)):
             if state & bit:
                 self.mods.add(mod)
+
         name = Gdk.keyval_name(keyval)
+
+        # A modifier on its own: show it, keep listening.
+        if name in ("Super_L", "Super_R", "Control_L", "Control_R",
+                    "Shift_L", "Shift_R", "Alt_L", "Alt_R",
+                    "Meta_L", "Meta_R", "ISO_Level3_Shift"):
+            self._refresh()
+            return True
+
         if not name:
             return True
-        self.keyval = keyval
+        if len(name) == 1:
+            name = name.upper()
         self.keyval_name = name
-        self.rec_btn.set_active(False)
-        self.entry.set_text(self.value())
+        self.recording = False
+        self.button.remove_css_class("recording")
+        self._refresh()
         return True
 
 
@@ -1078,11 +1410,40 @@ class HyprGuiWindow(Adw.ApplicationWindow):
             page = self.tabs.append(prefs)
             page.set_title(title)
 
+        # hypr-gui --tab Keybindings opens straight to a tab, so it can be
+        # bound to a key or launched from a menu entry.
+        wanted = ""
+        if "--tab" in sys.argv:
+            try:
+                wanted = sys.argv[sys.argv.index("--tab") + 1].lower()
+            except IndexError:
+                pass
+        if wanted:
+            for i in range(self.tabs.get_n_pages()):
+                page = self.tabs.get_nth_page(i)
+                if page.get_title().lower() == wanted:
+                    self.tabs.set_selected_page(page)
+                    break
+
         self.status = Adw.StatusPage(icon_name="emblem-ok-symbolic",
                                      title="No pending changes",
                                      description="Everything on disk matches the compositor.")
         self.status.set_vexpand(True)
         self.tabs.append(self.status).set_title("Status")
+
+        # hypr-gui --tab Keybindings opens straight to a tab, so it can be
+        # bound to a key or launched from a menu entry. Done after every page
+        # exists, since appending one would otherwise change the selection.
+        if "--tab" in sys.argv:
+            try:
+                wanted = sys.argv[sys.argv.index("--tab") + 1].lower()
+            except IndexError:
+                wanted = ""
+            for i in range(self.tabs.get_n_pages()):
+                page = self.tabs.get_nth_page(i)
+                if page.get_title().lower() == wanted:
+                    self.tabs.set_selected_page(page)
+                    break
 
         actions = [
             ("reset", self.on_reset),
@@ -1248,9 +1609,9 @@ class HyprGuiWindow(Adw.ApplicationWindow):
 
         row = Adw.ActionRow(title="Shortcut")
         self.new_key = KeyEntry()
-        self.new_key.set_size_request(320, -1)
+        self.new_key.set_hexpand(True)
         row.add_suffix(self.new_key)
-        row.set_activatable_widget(self.new_key.entry)
+        row.set_title_lines(0)
         add.add(row)
 
         # --- dispatcher dropdown
@@ -1359,15 +1720,19 @@ class HyprGuiWindow(Adw.ApplicationWindow):
             box.append(row)
 
     def _selected_dispatcher(self):
-        """("exec", None, None) for the command row, else (path, key, desc)."""
+        """(path, key, plain, desc) for the chosen Action row.
+
+        Row 0 is the standalone "Run a command…" choice; it reports key=None so
+        the argument row stays hidden and the command picker is the only input.
+        """
         i = self.disp_combo.get_selected()
         if i <= 0:
-            return "exec_cmd", "cmd", None
-        _name, path, key, _plain, desc = DISPATCHERS[i - 1]
-        return path, key, desc
+            return "exec_cmd", None, True, None
+        _name, path, key, plain, desc = DISPATCHERS[i - 1]
+        return path, key, plain, desc
 
     def _disp_changed(self):
-        path, key, desc = self._selected_dispatcher()
+        path, key, plain, desc = self._selected_dispatcher()
         is_exec = path in ("exec_cmd", "exec_raw")
         self.cmd_box.set_visible(is_exec)
         self._disp_desc.set_text("Type any command; it runs through a shell."
@@ -1391,7 +1756,7 @@ class HyprGuiWindow(Adw.ApplicationWindow):
         return DISPATCHERS[i - 1][0] if i > 0 else "exec"
 
     def _current_arg(self):
-        path, key, _desc = self._selected_dispatcher()
+        path, key, _plain, _desc = self._selected_dispatcher()
         if key is None:
             return ""
         display = self._current_display()
@@ -1401,7 +1766,7 @@ class HyprGuiWindow(Adw.ApplicationWindow):
         return self.arg_entry.get_text().strip()
 
     def _sync_cmd(self):
-        path, key, _desc = self._selected_dispatcher()
+        path, _key, _plain, _desc = self._selected_dispatcher()
         if path in ("exec_cmd", "exec_raw"):
             n = len(self.cmd_box.commands)
             self.cmd_hint.set_text(f"{n} commands found on your PATH")
@@ -1413,7 +1778,7 @@ class HyprGuiWindow(Adw.ApplicationWindow):
         if not keys:
             self.notify("Record a shortcut first")
             return
-        path, key, _desc = self._selected_dispatcher()
+        path, key, _plain, _desc = self._selected_dispatcher()
         is_exec = path in ("exec_cmd", "exec_raw")
         arg = self._current_arg()
         command = self.cmd_box.value() if is_exec else ""
@@ -1433,6 +1798,7 @@ class HyprGuiWindow(Adw.ApplicationWindow):
         })
         self.new_key.set_value("")
         self.new_desc.set_text("")
+        self.arg_entry.set_text("")
         self.cmd_box.set_value("")
         self._rebuild_binds()
         self.mark_dirty()
@@ -1599,11 +1965,48 @@ def preflight():
     return problems
 
 
+CSS = b"""
+/* The press-to-record area: a big obvious target, not a one-line field. */
+button.key-capture {
+  padding: 12px 16px;
+  border-radius: 12px;
+  border: 2px dashed alpha(currentColor, 0.35);
+  background: none;
+}
+button.key-capture:hover {
+  background-color: alpha(currentColor, 0.06);
+  border-color: alpha(currentColor, 0.55);
+}
+button.key-capture:focus {
+  outline: none;
+}
+button.key-capture label.key-capture-label {
+  font-size: 20pt;
+  font-weight: 700;
+  font-family: monospace;
+}
+/* While listening it fills in, so you can see it caught the key. */
+button.key-capture.recording {
+  border-style: solid;
+  border-color: alpha(@accent_color, 0.9);
+  background-color: alpha(@accent_color, 0.16);
+}
+button.key-capture.recording label.key-capture-label {
+  color: @accent_color;
+}
+"""
+
+
 class HyprGuiApp(Adw.Application):
     def __init__(self):
         super().__init__(application_id="io.github.ppSpacker420.hyprgui",
                          flags=Gio.ApplicationFlags.NON_UNIQUE)
         self.window = None
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
     def do_activate(self):
         if self.window is None:

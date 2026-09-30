@@ -82,8 +82,42 @@ The **Action** dropdown lists every dispatcher your Hyprland exposes, each with
 a one-line description. Pick one and the right argument control appears — a
 dropdown of common values (`left`, `maximized`, `toggle`) where the set is
 fixed, or a free-text box where it isn't. Choose "Run a command…" to get a
-searchable list of everything on your `PATH`, which is scanned per machine
-rather than bundled, so it shows what *you* can actually run.
+searchable list of everything this machine can run.
+
+That list is built by scanning, never bundled — the set of usable commands
+differs completely between distros, so a shipped list would be wrong
+everywhere except the author's box. Three sources are combined:
+
+1. every executable on `$PATH`
+2. `Exec=` lines from `.desktop` entries, which is how Flatpak and Snap apps
+   are installed and are otherwise invisible to a `PATH` scan
+3. `alias` and `function` definitions from your shell rc files, which are
+   runnable but are not files at all
+
+Names carrying a dot are kept (`fsck.btrfs`, `alsa-info.sh`,
+`gst-launch-1.0` are all real commands); what gets dropped is libraries, data
+files, bare interpreters, and versioned twins like `aclocal-1.18` when plain
+`aclocal` is also present. The result is cached for two hours under
+`$XDG_CACHE_HOME/hypr-gui`, since the scan touches every directory on `PATH`.
+
+Static and read-only: the rc files are parsed as text, nothing is evaluated,
+and anything a shell generates at runtime is invisible.
+
+### Recording a shortcut
+
+The **Shortcut** field is a large press-to-record area, not a one-line text
+field — pressing keys is the main interaction here, so it gets the space. Click
+anywhere on it to arm it, press the combination, and it shows what it caught.
+
+- a lone modifier shows as `SUPER + …` and keeps listening, so you can see it
+  register before adding the key
+- bare keys are allowed — `Q`, not just `SUPER + Q`
+- `Backspace` clears and keeps listening, `Escape` cancels
+- a text box underneath accepts `super+shift+r` or `super-r` typed by hand,
+  normalised to `SUPER + SHIFT + R` with modifiers in a fixed order
+
+The app also takes `--tab <name>`, so `hypr-gui --tab Keybindings` opens
+straight to a tab and can be bound to a key.
 
 Dispatcher names and argument keys were read out of the running compositor's
 own `hl.dsp` tables, not copied from documentation. This matters: the 0.56+
@@ -97,9 +131,10 @@ wrong. The test suite probes all 50 against the live compositor.
 python3 test_hypr_gui.py      # config backends + live compositor
 python3 test_dispatchers.py   # every dispatcher constructs
 python3 test_ui.py            # builds the real GTK window
+python3 test_scan.py          # command discovery
 ```
 
-102 checks across three suites:
+189 checks across four suites:
 
 - **test_hypr_gui.py** — renders both the Lua and `.conf` backends into a temp
   directory and checks structure, injection, idempotency and the safety gates;
@@ -107,8 +142,14 @@ python3 test_ui.py            # builds the real GTK window
   `hyprctl getoption`, exercises rollback, and restores your config
 - **test_dispatchers.py** — probes all 50 dispatchers against the live
   compositor, and checks bindings actually register
-- **test_ui.py** — constructs the real GTK window and exercises the dropdown,
-  search and add-binding path in a temp directory
+- **test_ui.py** — constructs the real GTK window and exercises the
+  dispatcher dropdown, the command search, the shortcut recorder (typed,
+  recorded and cancelled) and the add-binding path, in a temp directory. It
+  also runs itself in a child process and fails on any Gtk-CRITICAL, because a
+  misused widget passes every assertion while still breaking the app
+- **test_scan.py** — command discovery against synthetic `PATH`, `.desktop`
+  and rc fixtures: which names are kept, which are dropped, and that launch
+  wrappers (`env`, `nohup`, `flatpak`, `sh -c`) are unwrapped correctly
 
 The live half skips itself with a message if no Hyprland session is reachable.
 `test_ui.py` runs headless but does need a display for GTK to construct

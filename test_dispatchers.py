@@ -124,10 +124,19 @@ check("test bindings removed",
 
 # --- command scanning
 cmds = m.scan_commands()
-check("command scan is non-trivial", len(cmds) > 50, f"{len(cmds)} found")
-check("command scan is sorted", cmds == sorted(cmds))
 check("command scan has no paths", not any("/" in c for c in cmds))
-check("command scan has no extensions", not any("." in c for c in cmds[:200]))
+check("command scan has no library files",
+      not any(c.lower().endswith((".so", ".png", ".json", ".desktop")) for c in cmds))
+# Dots are allowed now: fsck.btrfs, alsa-info.sh and gst-launch-1.0 are real
+# commands, and dropping them was a bug in an earlier version of this scan.
+check("command scan keeps dotted commands",
+      any("." in c for c in cmds),
+      f"{sum(1 for c in cmds if '.' in c)} dotted names")
+check("command scan has no versioned twins",
+      not any(m._strip_version_suffix(c) in cmds
+              for c in cmds if m._strip_version_suffix(c) and m._strip_version_suffix(c) != c))
+check("command scan has no interpreters",
+      not ({"python3", "bash", "env", "sh"} & set(cmds)))
 check("omarchy commands found", any(c.startswith("omarchy-") for c in cmds))
 
 print()

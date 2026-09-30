@@ -43,7 +43,7 @@ fi
 # --- install -------------------------------------------------------------
 mkdir -p "$PREFIX/hypr-gui" "$BIN" "$APPS"
 install -m 644 "$SRC/hypr_gui.py"        "$PREFIX/hypr-gui/hypr_gui.py"
-for t in test_hypr_gui.py test_dispatchers.py test_ui.py; do
+for t in test_hypr_gui.py test_dispatchers.py test_ui.py test_scan.py; do
   [ -f "$SRC/$t" ] && install -m 644 "$SRC/$t" "$PREFIX/hypr-gui/$t"
 done
 install -m 644 "$SRC/README.md"          "$PREFIX/hypr-gui/README.md"
